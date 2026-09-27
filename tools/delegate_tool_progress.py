@@ -220,8 +220,15 @@ def _resolve_workspace_hint(parent_agent) -> Optional[str]:
     """Best-effort local workspace hint for child prompts: only a concrete
     absolute directory is ever injected (never a fake container path)."""
     from agent.runtime_cwd import scope_terminal_cwd
+    from tools.terminal_scope import terminal_env
+
+    live_cwd = None
+    if terminal_env("TERMINAL_ENV", "local") == "local":
+        from tools.delegate_tool_child_run import _parent_workspace_cwd
+
+        live_cwd = _parent_workspace_cwd(getattr(parent_agent, "_current_task_id", None))
     candidates = [
-        scope_terminal_cwd(), getattr(getattr(parent_agent, "_subdirectory_hints", None), "working_dir", None),
+        live_cwd, scope_terminal_cwd(), getattr(getattr(parent_agent, "_subdirectory_hints", None), "working_dir", None),
         getattr(parent_agent, "terminal_cwd", None), getattr(parent_agent, "cwd", None),
     ]
     for candidate in filter(None, candidates):

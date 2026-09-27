@@ -382,6 +382,14 @@ def _register_child(
     })
     return _subagent_id
 
+def _parent_workspace_cwd(parent_task_id: Optional[str]) -> Optional[str]:
+    """Match the terminal's cwd-record key without changing task/container ownership."""
+    from tools.terminal_tool import get_session_cwd
+    from tools.terminal_tool_config import resolve_cwd_session_key
+
+    return get_session_cwd(resolve_cwd_session_key(parent_task_id)) or get_session_cwd(parent_task_id)
+
+
 def _create_isolated_worktree(parent_agent: Any, parent_task_id: Any, subagent_id: Optional[str]):
     """Opt-in worktree isolation: own git worktree off the parent's HEAD (the
     child's terminal starts there). Git-only, local-backend-only; failures
@@ -396,8 +404,7 @@ def _create_isolated_worktree(parent_agent: Any, parent_task_id: Any, subagent_i
             return None
         _parent_cwd = None
         with _quiet(None):
-            from tools.terminal_tool import get_session_cwd as _gsc
-            _parent_cwd = _gsc(parent_task_id)
+            _parent_cwd = _parent_workspace_cwd(parent_task_id)
         return subagent_worktree.create_subagent_worktree(
             _parent_cwd or _resolve_workspace_hint(parent_agent), subagent_id=subagent_id,
         )
@@ -755,8 +762,8 @@ class _ChildRun:
         # but the child's later `cd`s stay in its own record. Per-session container
         # isolation keys containers by task_id; the child must share the PARENT's.
         with _quiet("Child cwd seed failed: %s"):
-            from tools.terminal_tool import get_session_cwd, record_session_cwd, register_container_alias
-            record_session_cwd(self.child_task_id, get_session_cwd(self.parent_task_id))
+            from tools.terminal_tool import record_session_cwd, register_container_alias
+            record_session_cwd(self.child_task_id, _parent_workspace_cwd(self.parent_task_id))
             register_container_alias(self.child_task_id, self.parent_task_id)
 
         self.worktree_info = _create_isolated_worktree(self.parent_agent, self.parent_task_id, self.subagent_id)

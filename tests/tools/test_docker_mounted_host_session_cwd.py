@@ -16,6 +16,10 @@ When the registered cwd is the mounted host directory, both must land on
 ``/workspace`` instead. In-container paths and an explicit workdir stay as-is.
 """
 
+import json
+from contextlib import nullcontext
+from types import SimpleNamespace
+
 import pytest
 
 import tools.terminal_tool as tt
@@ -174,3 +178,86 @@ class TestMountedHostSessionCwd:
         finally:
             tt.clear_task_env_overrides(task_id)
         assert env.execute_cwds[-1] == "/workspace/sub"
+
+
+@pytest.mark.parametrize("promoted", [False, True], ids=["background", "timeout-promoted"])
+@pytest.mark.parametrize("workdir", [None, "/srv"], ids=["recorded", "explicit"])
+@pytest.mark.parametrize("delegated", [False, True], ids=["parent", "child"])
+def test_background_overlapping_mount_matches_guard(
+    docker_session, monkeypatch, promoted, workdir, delegated,
+):
+    """Guard and spawn must translate a host path once, without rerouting notices."""
+    from agent.delegation_context import delegated_child_context
+    from cron import lifecycle_guard
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from tools import process_registry as pr
+    from tools.approval_context import (
+        get_current_session_key, reset_current_session_key, set_current_session_key,
+    )
+
+    env = docker_session("/srv")
+    env.host_cwd_mount = "/srv/container"
+    env.cwd = env.host_cwd_mount
+    routing_key = "discord:thread:parent"
+    task_id = "child-task" if delegated else "parent-task"
+    tt._active_environments[task_id] = env
+    tt.record_session_cwd(routing_key, "/workspace/parent" if delegated else "/srv")
+    if delegated:
+        tt.record_session_cwd(task_id, "/srv")
+        tt.register_container_alias(task_id, "parent-task")
+    registry = pr.ProcessRegistry()
+    monkeypatch.setattr(pr, "process_registry", registry)
+    monkeypatch.setattr(pr, "_is_supervised_gateway_process", lambda: True)
+    seen = {}
+    scan = lifecycle_guard.scan_gateway_lifecycle
+
+    def capture_scan(command, **kwargs):
+        seen["guard_cwd"] = kwargs["cwd"]
+        return scan(command, **kwargs)
+
+    def capture_approval(*args, **kwargs):
+        seen["approval_key"] = get_current_session_key()
+        return {"approved": True}
+
+    def capture_spawn(**kwargs):
+        # Stop at the remote process boundary: no Docker daemon is needed.
+        seen["spawn"] = kwargs
+        process = SimpleNamespace(id="background-test", pid=1, **kwargs)
+        seen["process"] = process
+        return process
+
+    monkeypatch.setattr(lifecycle_guard, "scan_gateway_lifecycle", capture_scan)
+    monkeypatch.setattr(tt, "_check_all_guards", capture_approval)
+    monkeypatch.setattr(registry, "spawn_via_env", capture_spawn)
+    token = set_current_session_key(routing_key)
+    session_tokens = set_session_vars(
+        platform="discord", chat_id="test-chat", thread_id="test-thread",
+        session_key=routing_key, session_id="parent-session",
+    )
+    try:
+        with delegated_child_context() if delegated else nullcontext():
+            result = json.loads(tt.terminal_tool(
+                command="pwd", task_id=task_id, workdir=workdir,
+                background=not promoted,
+                timeout=tt.FOREGROUND_MAX_TIMEOUT + 1 if promoted else None,
+                notify_on_complete=True,
+            ))
+        assert result["exit_code"] == 0, result
+        assert bool(result.get("promoted_from_foreground")) == promoted
+        process = seen["process"]
+        assert seen["guard_cwd"] == env.host_cwd_mount
+        assert process.cwd == seen["guard_cwd"]
+        assert seen["spawn"]["env"] is env
+        assert process.owner_task_id == task_id
+        assert process.session_key == routing_key
+        assert seen["approval_key"] == routing_key
+        assert get_current_session_key() == routing_key
+        assert process.watcher_chat_id == "test-chat"
+        assert process.watcher_thread_id == "test-thread"
+        assert registry.pending_watchers[0]["session_key"] == routing_key
+        assert tt.get_session_cwd(routing_key) == ("/workspace/parent" if delegated else "/srv")
+        if delegated:
+            assert tt.get_session_cwd(task_id) == "/srv"
+    finally:
+        clear_session_vars(session_tokens)
+        reset_current_session_key(token)

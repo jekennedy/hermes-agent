@@ -43,6 +43,16 @@ def _parse_env_var(name: str, default: str, converter: Any = int, type_label: st
         )
 
 
+def resolve_cwd_session_key(task_id: str | None) -> str:
+    """Cwd identity is child-local even while approvals route to the parent."""
+    from agent.delegation_context import is_delegated_child_context
+    from tools.approval_context import get_current_session_key
+
+    if is_delegated_child_context():
+        return task_id or ""
+    return get_current_session_key(default="") or task_id or ""
+
+
 def _safe_getcwd() -> str:
     """``os.getcwd()`` tolerant of a deleted cwd (FileNotFoundError) or a macOS
     TCC-protected one without Full Disk Access (PermissionError); falls back

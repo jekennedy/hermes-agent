@@ -1221,6 +1221,9 @@ def _run_foreground(
     workdir: Optional[str], approval_note: Optional[str], clear_interrupt: bool,
 ) -> str:
     """Execute in the foreground with retry on transient errors, then finalize."""
+    from tools.terminal_tool_config import resolve_cwd_session_key
+
+    cwd_session_key = resolve_cwd_session_key(task_id)
     max_retries = 3
     env_type, eff, effective_timeout = plan.env_type, plan.effective_task_id, plan.effective_timeout
 
@@ -1236,7 +1239,7 @@ def _run_foreground(
     for retry_count in range(max_retries + 1):
         try:
             command_cwd = _resolve_command_cwd(
-                workdir=workdir, default_cwd=plan.cwd, session_key=session_key, env_type=env_type,
+                workdir=workdir, default_cwd=plan.cwd, session_key=cwd_session_key, env_type=env_type,
                 mounted_host=getattr(env, "host_cwd", None) or plan.host_cwd,
                 env=env,
             )
@@ -1271,7 +1274,7 @@ def _run_foreground(
         }, ensure_ascii=False)
     return finalize_foreground_result(
         command=command, result=result, env=env, env_type=env_type, effective_task_id=eff,
-        task_id=task_id, session_id=session_id, session_key=session_key, workdir=workdir,
+        task_id=task_id, session_id=session_id, session_key=cwd_session_key, workdir=workdir,
         command_cwd=command_cwd, approval_note=approval_note,
     )
 
@@ -1381,12 +1384,13 @@ def terminal_tool(
         env = _acquire_env(plan, task_id)
         env_type, cwd, effective_task_id = plan.env_type, plan.cwd, plan.effective_task_id
 
-        # Session key for cwd records: the contextvar doesn't cross tool-worker
-        # threads, so fall back to the raw task_id (the top-level agent's
-        # session_key) as a stable anchor.
+        # Cwd is child-local; approval and background notification routing keep
+        # the parent's session key. Never use cwd identity for process routing.
         from tools.approval import get_current_session_key
+        from tools.terminal_tool_config import resolve_cwd_session_key
 
         session_key = get_current_session_key(default="") or (task_id or "")
+        cwd_session_key = resolve_cwd_session_key(task_id)
 
         # The supervised-gateway identity probe ends in a kernel process query
         # (psutil create_time) that has wedged for the better part of an hour on
@@ -1406,7 +1410,7 @@ def terminal_tool(
         try:
             bounded_guard = run_bounded_sync(
                 lambda: _pre_exec_block(
-                    command, env=env, env_type=env_type, cwd=cwd, workdir=workdir, session_key=session_key,
+                    command, env=env, env_type=env_type, cwd=cwd, workdir=workdir, session_key=cwd_session_key,
                 ),
                 guard_timeout,
                 label="terminal.pre-exec-guard",
@@ -1432,6 +1436,7 @@ def terminal_tool(
             result = spawn_background_process(
                 command=command, env=env, env_type=env_type, effective_task_id=effective_task_id,
                 task_id=task_id, session_key=session_key, workdir=workdir, cwd=cwd,
+                cwd_session_key=cwd_session_key,
                 mounted_host=getattr(env, "host_cwd", None) or plan.host_cwd,
                 effective_pty=pty and not pty_disabled, notify_on_complete=notify_on_complete,
                 watch_patterns=watch_patterns, approval_note=verdict.note,
